@@ -1,0 +1,133 @@
+#!/bin/sh
+
+# setup-acme-dns-service: Set up acme-dns as systemd service.
+
+if [ "$(id -u)" != "0" ]; then
+	echo "Must be root!"
+	exit 1
+fi
+
+do_build() {
+
+	echo "Info: Building acme-dns."
+
+	# Must have go to build.
+	if ! command -v go >/dev/null 2>&1 ; then
+		command -v yum >/dev/null 2>&1 && pakman="yum"
+		command -v dnf >/dev/null 2>&1 && pakman="dnf"
+		command -v apt >/dev/null 2>&1 && pakman="apt"
+		if [ -z "$pakman" ]; then
+			echo "Error: Unsupported Distro."
+			exit 1
+		fi
+		[ "$pakman"  = "apt" ] && apt update
+		"$pakman" install -y golang
+	fi
+
+	rm -f acme-dns
+
+	export GOPATH=/tmp/acme-dns
+	if ! go build ; then
+		echo "Error: Build failed."
+		exit 1
+	else
+		# Stop the service and delete the current executable.  The new one will be copied below.
+		systemctl is-enabled acme-dns.service >/dev/null 2>&1 && systemctl stop acme-dns.service
+		sleep 2s
+		rm -f /usr/local/bin/acme-dns
+		echo "Info: Build succeeded."
+	fi
+}
+
+create_default_config() {
+
+	echo "Info: Creating a simple config.cfg file."
+	# The gateway interface is a logical choice to listen for requests.  Use it, rather than all interfaces,
+	# as the default to avoid conflicts on systems running systemd-resolved.
+	ip="$(ip -4 r | grep ^default | awk '{print $9}')"
+	[ -z "$ip" ] && ip="0.0.0.0"
+	# Get the external ip.
+	eip="$(curl ifconfig.io || :)"
+	[ -z "$eip" ] && eip="11.22.33.44"
+	# Set the domain to the top-level-domain and the next level below of the current hostname, e.g. your-company.com.
+	hostname="$(cat /proc/sys/kernel/hostname)"
+	stripped="${hostname%.*}"
+	domain="${stripped##*.}.${hostname##*.}"
+	# If the hostname is not a fully-qualified domain name (no periods), just leave it as example.
+	echo "$hostname" | grep '\.' >/dev/null 2>&1 || domain="example.org"
+	cp config.cfg /tmp/
+	sed -i /tmp/config.cfg \
+	  -e "s/^listen .*/listen = \"${ip}:53\"/" \
+	  -e "s/^ip .*/ip = \"${ip}\"/" \
+	  -e "s/198.51.100.1/${eip}/" \
+	  -e 's/^port = "443".*/port = "8080"/' \
+	  -e 's/^tls .*/tls = "none"/' \
+	  -e "s/example.org/${domain}/g"
+	echo "Info: Changes to default config:"
+	diff config.cfg /tmp/config.cfg
+	mkdir -p /etc/acme-dns
+	mv /tmp/config.cfg /etc/acme-dns
+}
+
+workdir="$(dirname "$0")"
+cd "$workdir" || :
+
+# First, build the project if needed.
+build="false"
+command -v acme-dns >/dev/null 2>&1 || build="true"
+# Did the user request a rebuild?
+echo "$1" | grep -Eqi "^build|^rebuild" && build="true"
+if [ "$build" = "true" ]; then
+	do_build
+else
+	behind="$(git rev-list --count HEAD.."@{u}")"
+	[ "${behind}" != "0" ] && echo "Warning: acme-dns is behind upstream by ${behind} commits."
+fi
+
+# If a build was not performed and the service is enabled, there is nothing more to do!
+[ "$build" != "true" ] && systemctl is-enabled acme-dns.service >/dev/null 2>&1 && exit 0
+
+## Make sure that you have moved the configuration file to /etc/acme-dns/config.cfg so that acme-dns can access it globally.
+
+if [ ! -e /etc/acme-dns/config.cfg ]; then
+	create_default_config
+else
+	echo "Info: Using current configration."
+fi
+
+## Move the acme-dns executable from ~/go/bin/acme-dns to /usr/local/bin/acme-dns (Any location will work, just be sure to change acme-dns.service to match).
+
+if [ ! -x /usr/local/bin/acme-dns ]; then
+	echo "Info: Copying the executable to /usr/local/bin."
+	cp -p acme-dns /usr/local/bin/
+fi
+
+## Create a minimal acme-dns user: sudo adduser --system --gecos "acme-dns Service" --disabled-password --group --home /var/lib/acme-dns acme-dns.
+
+if ! id -u "acme-dns" >/dev/null 2>&1 ; then
+	echo "Info: Creating acme-dns user."
+	useradd --system --comment "acme-dns Service" --user-group --create-home --home-dir /var/lib/acme-dns acme-dns
+	# If the home directory was restored from another system, it might have incorrect owner and group values, so reset them just in case.
+	chown --changes -R acme-dns:acme-dns /var/lib/acme-dns
+fi
+
+## Move the systemd service unit from acme-dns.service to /etc/systemd/system/acme-dns.service.
+## Reload systemd units: sudo systemctl daemon-reload.
+## Enable acme-dns on boot: sudo systemctl enable acme-dns.service.
+
+if [ ! -e /etc/systemd/system/acme-dns.service ]; then
+	echo "Info: Copying the acme-dns service to the systemd directory."
+	cp -p acme-dns.service /etc/systemd/system/
+	echo "Info: Doing a systemd daemon-reload."
+	systemctl daemon-reload
+	echo "Info: Enabling the acme-dns service."
+	systemctl enable acme-dns.service
+fi
+
+## Run acme-dns: sudo systemctl start acme-dns.service.
+
+echo "Info: Starting the service."
+systemctl start acme-dns.service
+
+exit 0
+
